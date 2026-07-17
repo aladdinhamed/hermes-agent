@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 FailureCallback = Callable[[str, BaseException], None]
 TitleCallback = Callable[[str], None]
 
+# Validation callback: () -> bool. Called right before the LLM request in
+# generate_title(). Return False to skip — e.g. the user switched models
+# after this background thread captured its runtime snapshot, and sending
+# the request would reload a model the runtime already evicted (#19027).
+RuntimeValidator = Callable[[], bool]
+
 _TITLE_PROMPT = (
     "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
     "following exchange. The title should capture the main topic or intent. "
@@ -54,6 +60,7 @@ def generate_title(
     timeout: Optional[float] = None,
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
 ) -> Optional[str]:
     """Generate a session title from the first exchange.
 
@@ -65,7 +72,22 @@ def generate_title(
     auxiliary call raises — the caller typically wires this to
     ``AIAgent._emit_auxiliary_failure`` so the user sees a warning instead
     of silently accumulating untitled sessions.
+
+    ``runtime_validator`` is called right before the LLM request. If it
+    returns False (e.g. the user's model was switched since the background
+    thread captured its runtime snapshot), the call is skipped silently —
+    no request is sent, so a stale title request can't reload a model the
+    runtime already unloaded (#19027).
     """
+    if runtime_validator is not None:
+        try:
+            if not runtime_validator():
+                logger.debug("Title generation skipped: runtime validator returned False")
+                return None
+        except Exception:
+            # Fail open: a broken validator must not disable titling.
+            logger.debug("Title runtime validator raised; proceeding", exc_info=True)
+
     # Truncate long messages to keep the request small
     user_snippet = user_message[:500] if user_message else ""
     assistant_snippet = assistant_response[:500] if assistant_response else ""
@@ -125,6 +147,7 @@ def auto_title_session(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Generate and set a session title if one doesn't already exist.
 
@@ -133,6 +156,7 @@ def auto_title_session(
     - session_db is None
     - session already has a title (user-set or previously auto-generated)
     - title generation fails
+    - runtime_validator returns False (model was switched)
 
     Never lets an exception escape: this is a daemon-thread target, and an
     escaping exception would spray a raw traceback into the user's terminal
@@ -152,6 +176,7 @@ def auto_title_session(
             failure_callback=failure_callback,
             main_runtime=main_runtime,
             title_callback=title_callback,
+            runtime_validator=runtime_validator,
         )
     except Exception as e:
         # WARNING (not debug) so operators see it in agent.log; the message
@@ -177,6 +202,7 @@ def _auto_title_session(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Body of :func:`auto_title_session` — see its docstring."""
     if not session_db or not session_id:
@@ -210,7 +236,11 @@ def _auto_title_session(
     set_accounting_context(session_db, session_id)
 
     title = generate_title(
-        user_message, assistant_response, failure_callback=failure_callback, main_runtime=main_runtime
+        user_message,
+        assistant_response,
+        failure_callback=failure_callback,
+        main_runtime=main_runtime,
+        runtime_validator=runtime_validator,
     )
     if not title:
         return
@@ -236,6 +266,7 @@ def maybe_auto_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Fire-and-forget title generation after the first exchange.
 
@@ -261,6 +292,7 @@ def maybe_auto_title(
             "failure_callback": failure_callback,
             "main_runtime": main_runtime,
             "title_callback": title_callback,
+            "runtime_validator": runtime_validator,
         },
         daemon=True,
         name="auto-title",
